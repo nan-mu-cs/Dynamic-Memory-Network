@@ -115,9 +115,19 @@ class DynamicMemoryNetwork(object):
         min_after_dequeue = 10000
         capacity = min_after_dequeue + 3 * self._options.batch_size
 
-        return tf.train.shuffle_batch([inputs, questions, answers, fact_count, input_mask],
-                                batch_size=self._options.batch_size, capacity=capacity,
-                                min_after_dequeue=min_after_dequeue)
+        batch_inputs, batch_questions, batch_answers, batch_fact_count, input_mask = tf.train.shuffle_batch(
+            [inputs, questions, answers, fact_count, input_mask],
+            batch_size=self._options.batch_size, capacity=capacity,
+            min_after_dequeue=min_after_dequeue)
+        padded_inputs = tf.contrib.keras.preprocessing.sequence.pad_sequences(batch_inputs, dtype='float32',
+                                                                              paddings='post', value=0)
+        padded_questions = tf.contrib.keras.preprocessing.sequence.pad_sequences(batch_questions, dtype='float32',
+                                                                                 paddings='post', value=0)
+        max_fact_count = tf.contrib.keras.backend.max(batch_fact_count)
+        padded_input_mask = tf.contrib.keras.preprocessing.sequence.pad_sequences(batch_questions,
+                                                                                  maxlen=max_fact_count, dtype='int32',
+                                                                                  paddings='post', value=-1)
+        return padded_inputs, padded_questions, batch_answers, batch_fact_count, padded_input_mask
 
     def generate_next_test_batch(self):
         inputs = tf.constant(self.test_inputs)
@@ -130,8 +140,8 @@ class DynamicMemoryNetwork(object):
         capacity = min_after_dequeue + 3 * self._options.batch_size
 
         return tf.train.shuffle_batch([inputs, questions, answers, fact_count, input_mask],
-                                batch_size=self._options.batch_size, capacity=capacity,
-                                min_after_dequeue=min_after_dequeue)
+                                      batch_size=self._options.batch_size, capacity=capacity,
+                                      min_after_dequeue=min_after_dequeue)
 
 
 def main(_):
