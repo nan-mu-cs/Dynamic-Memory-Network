@@ -37,6 +37,8 @@ flags.DEFINE_integer("save_every", 10, "save state every x epoch")
 flags.DEFINE_float("dropout", 0.0, "dropout rate (between 0 and 1)")
 flags.DEFINE_float("learning_rate", 0.5, "learning rate")
 flags.DEFINE_boolean("batch_norm", False, "batch normalization")
+flags.DEFINE_integer("save_per_epoch", 2, "save parameter every nth epoch")
+flags.DEFINE_boolean("restore_model", False, "restore model")
 
 
 class DynamicMemoryNetwork(object):
@@ -49,23 +51,24 @@ class DynamicMemoryNetwork(object):
         self.load_train_data()
         self.load_test_data()
         self.vocab_size = len(self.word2vec)
-        #print("vocab_size ==> %d" % self.vocab_size)
+        # print("vocab_size ==> %d" % self.vocab_size)
         self.build_graph()
+        self.saver = tf.train.Saver()
 
     def load_train_data(self):
         babi_raw = utils.get_babi_train_raw(self._options.babi_train_id)
-        self.train_inputs, self.train_questions, self.train_answers, self.train_fact_count, self.train_input_mask = self._process_input(
+        self.train_inputs, self.train_questions, self.train_answers, self.train_fact_count, self.train_input_mask, self.max_train_question_len = self._process_input(
             babi_raw)
         print("==> training data loaded")
         # print(self.train_inputs.shape)
-        # print(self.train_questions.shape)
+        print(self.train_questions.shape[0])
         # print(self.train_answers.shape)
         # print(self.train_fact_count)
         # print(self.train_input_mask.shape)
 
     def load_test_data(self):
         babi_raw = utils.get_babi_test_raw(self._options.babi_test_id)
-        self.test_inputs, self.test_questions, self.test_answers, self.test_fact_count, self.test_input_mask = self._process_input(
+        self.test_inputs, self.test_questions, self.test_answers, self.test_fact_count, self.test_input_mask, self.max_test_question_len = self._process_input(
             babi_raw)
         print("==> test data loaded")
 
@@ -134,7 +137,7 @@ class DynamicMemoryNetwork(object):
         # fact_counts = np.vstack(fact_counts).astype('int32')
         input_masks = [np.pad(m, (0, max_fact_count - len(m)), 'constant', constant_values=False) for m in input_masks]
         input_masks = np.asarray(input_masks)
-        return inputs, questions, answers, max_fact_count, input_masks
+        return inputs, questions, answers, max_fact_count, input_masks, max_question_len
 
     def generate_next_batch(self, inputs, questions, answers, input_mask):
         inputs = tf.constant(inputs, name="inputs_const")
@@ -142,7 +145,7 @@ class DynamicMemoryNetwork(object):
         answers = tf.constant(answers, name="answers_const")
         input_mask = tf.constant(input_mask, name="input_mask_const")
 
-        min_after_dequeue = 10000
+        min_after_dequeue = 1000
         capacity = min_after_dequeue + 3 * self._options.batch_size
         inputs, questions, answers, input_mask = tf.train.slice_input_producer([inputs, questions, answers, input_mask],
                                                                                num_epochs=self._options.epochs)
@@ -156,8 +159,13 @@ class DynamicMemoryNetwork(object):
         return self.generate_next_batch(self.train_inputs, self.train_questions, self.train_answers,
                                         self.train_input_mask)
 
-    def generate_next_test_batch(self):
-        return self.generate_next_batch(self.test_inputs, self.test_questions, self.test_answers, self.test_input_mask)
+    def generate_next_test_batch(self, start_index):
+        # return self.generate_next_batch(self.test_inputs, self.test_questions, self.test_answers, self.test_input_mask)
+        return self.test_inputs[start_index:start_index + self._options.batch_size], \
+               self.test_questions[start_index:start_index + self._options.batch_size], \
+               self.test_answers[start_index:start_index + self._options.batch_size], \
+               self.test_input_mask[start_index:start_index + self._options.batch_size], \
+               start_index + self._options.batch_size
 
     def make_decoder_batch_input(self, input):
         """ Reshape batch data to be compatible with Seq2Seq RNN decoder.
@@ -169,15 +177,24 @@ class DynamicMemoryNetwork(object):
         return tf.unstack(input_transposed)
 
     def build_graph(self):
-        inputs, questions, answers, input_mask = self.generate_next_train_batch()
+        if self._options.mode == "train":
+            self.inputs, self.questions, self.answers, self.input_mask = self.generate_next_train_batch()
+        else:
+            self.inputs = tf.placeholder(dtype=tf.float32, shape=[self._options.batch_size, self.test_fact_count,
+                                                                  self._options.word_vector_size])
+            self.questions = tf.placeholder(dtype=tf.float32,
+                                            shape=[self._options.batch_size, self.max_test_question_len,
+                                                   self._options.word_vector_size])
+            self.answers = tf.placeholder(dtype=tf.int32, shape=[self._options.batch_size])
+            self.input_mask = tf.placeholder(dtype=tf.bool, shape=[self._options.batch_size, self.test_fact_count])
 
         gru = core_rnn_cell.GRUCell(self._options.dim)
 
         with tf.variable_scope('input_question') as scope:
-            input_states, _ = seq2seq.rnn_decoder(self.make_decoder_batch_input(inputs),
+            input_states, _ = seq2seq.rnn_decoder(self.make_decoder_batch_input(self.inputs),
                                                   gru.zero_state(self._options.batch_size, tf.float32), gru)
             scope.reuse_variables()
-            question_states, _ = seq2seq.rnn_decoder(self.make_decoder_batch_input(questions),
+            question_states, _ = seq2seq.rnn_decoder(self.make_decoder_batch_input(self.questions),
                                                      gru.zero_state(self._options.batch_size, tf.float32), gru)
         question = question_states[-1]
 
@@ -185,7 +202,7 @@ class DynamicMemoryNetwork(object):
         facts = []
 
         for i in range(input_states.shape[0]):
-            filtered = tf.boolean_mask(input_states[i, :, :], input_mask[i, :])  # [?,dim]
+            filtered = tf.boolean_mask(input_states[i, :, :], self.input_mask[i, :])  # [?,dim]
             padding = tf.zeros([self.train_fact_count - tf.shape(filtered)[0], self._options.dim])
             facts.append(tf.concat([filtered, padding], 0))  # [max_fact_count,dim]
 
@@ -220,22 +237,39 @@ class DynamicMemoryNetwork(object):
 
         w_a = tf.Variable(tf.random_normal([self._options.dim, self.vocab_size], stddev=0.1), name="w_a")
         logits = tf.matmul(memory, w_a)
-        cross_entropy = tf.nn.sparse_softmax_cross_entropy_with_logits(logits=logits, labels=answers)
+        cross_entropy = tf.nn.sparse_softmax_cross_entropy_with_logits(logits=logits, labels=self.answers)
         loss = tf.reduce_mean(cross_entropy)
         self.total_loss = loss + self._options.l2 * tf.reduce_sum(tf.get_collection(tf.GraphKeys.REGULARIZATION_LOSSES))
 
-        predicts = tf.cast(tf.argmax(logits, 1), 'int32')
-        corrects = tf.equal(predicts, answers)
-        # num_corrects = tf.reduce_sum(tf.cast(corrects, tf.float32))
-        self.accuracy = tf.reduce_mean(tf.cast(corrects, tf.float32))
+        self.predicts = tf.cast(tf.argmax(logits, 1), 'int32')
+        self.corrects = tf.equal(self.predicts, self.answers)
+        self.num_corrects = tf.reduce_sum(tf.cast(self.corrects, tf.float32))
+        self.accuracy = tf.reduce_mean(tf.cast(self.corrects, tf.float32))
 
         self.global_step = tf.Variable(0, name="global_step")
         self.optimizer = tf.train.AdadeltaOptimizer(self._options.learning_rate).minimize(self.total_loss,
                                                                                           global_step=self.global_step)
 
+    def eval(self):
+        num_corrects = 0
+        step = len(self.test_questions) / self._options.batch_size
+        start_index = 0
+        for _ in range(step):
+            inputs, questions, answers, input_mask, start_index = self.generate_next_test_batch(start_index)
+            num_corrects += self._session.run([self.num_corrects], {
+                self.inputs: inputs,
+                self.questions: questions,
+                self.answers: answers,
+                self.input_mask: input_mask
+            })
+        print("test accuracy: %f" % (num_corrects * 1.0 / (step * self._options.batch_size)))
+
     def init(self):
-        init_op = tf.group(tf.global_variables_initializer(),
-                           tf.local_variables_initializer())
+        if self._options.restore_model:
+            self.saver.restore(self._session, self._load_path)
+        else:
+            init_op = tf.group(tf.global_variables_initializer(),
+                               tf.local_variables_initializer())
         self._session.run(init_op)
         print("Initialized")
 
@@ -244,6 +278,7 @@ class DynamicMemoryNetwork(object):
         threads = tf.train.start_queue_runners(sess=self._session, coord=coord)
         average_loss = 0
         step = 0
+        step_per_epoch = self.train_questions.shape[0] / self._options.batch_size
         try:
             while not coord.should_stop():
                 start_time = time.time()
@@ -254,13 +289,16 @@ class DynamicMemoryNetwork(object):
                     sys.exit(1)
                 duration = time.time() - start_time
                 average_loss += loss_val
-                if step % 200 == 0 and step > 0:
-                    average_loss /= 200
+                if step % 20 == 0 and step > 0:
+                    average_loss /= 20
                     print('Step: %d Avg_loss: %f Accuracy: %f(%.3f sec) \r' % (step, average_loss, accuracy, duration),
                           end="")
                     sys.stdout.flush()
                     average_loss = 0
-
+                if step > 0 and step % (step_per_epoch * self._options.save_per_epoch) == 0:
+                    self.saver.save(self._session,
+                                    os.path.join(self._options.save_path, "model.ckpt" + self._options.babi_train_id),
+                                    global_step=step)
         except tf.errors.OutOfRangeError:
             print('Done training for %d epochs, %d steps.' % (self._options.epochs, step))
         finally:
@@ -276,7 +314,10 @@ def main(_):
     with tf.Graph().as_default(), tf.Session() as session:
         model = DynamicMemoryNetwork(FLAGS, session)
         model.init()
-        model.run()
+        if FLAGS.mode == "train":
+            model.run()
+        else:
+            model.eval()
 
 
 if __name__ == "__main__":
